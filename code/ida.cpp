@@ -267,7 +267,7 @@ VkBool32 debugReportCallback(
 
 	if (flags & VK_DEBUG_REPORT_ERROR_BIT_EXT)
 	{
-		//assert(!"Validation error encountered!");
+		assert(!"Validation error encountered!");
 	}
 	return VK_FALSE;
 }
@@ -277,11 +277,9 @@ VkBool32 debugReportCallback(
 // NOTE: Not a great idea, but we have 1 image for foreseeable(!) future so...
 VkImageMemoryBarrier imageBarrier(
 	VkImage image, 
-	VkPipelineStageFlags srcStageMask, 
-	VkAccessFlags srcAccessMask,
-	VkImageLayout oldLayout,
-	VkPipelineStageFlags dstStageMask,
+	VkAccessFlags srcAccessMask, 
 	VkAccessFlags dstAccessMask,
+	VkImageLayout oldLayout,
 	VkImageLayout newLayout)
 {
 	VkImageMemoryBarrier result = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
@@ -289,7 +287,14 @@ VkImageMemoryBarrier imageBarrier(
 	result.dstAccessMask = dstAccessMask;
 	result.oldLayout = oldLayout;
 	result.newLayout = newLayout;
-	//result.srcQueueFamilyIndex = 
+	result.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	result.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	result.image = image;
+	result.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+	result.subresourceRange.levelCount = VK_REMAINING_MIP_LEVELS;
+	result.subresourceRange.layerCount = VK_REMAINING_ARRAY_LAYERS;
+
+	return result;
 }
 
 // Entry point
@@ -717,7 +722,7 @@ swapchainFormatPicked:
 	{
 		for (u32 i = 0; i < swapchainImageCount; ++i)
 		{
-			/**
+		/**
 		* FRAMEBUFFER
 		*/
 			VkFramebufferCreateInfo framebufferInfo = { VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO };
@@ -771,6 +776,11 @@ swapchainFormatPicked:
 
 		VK_CHECK(vkBeginCommandBuffer(commandBuffer, &beginInfo));
 
+		// NOTE: Before we start a pass we are rendering to an image and ???
+		VkImageMemoryBarrier renderBeginBarrier = imageBarrier(swapchainImages[imageIndex], 0, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+		vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 
+							 VK_DEPENDENCY_BY_REGION_BIT, 0, 0, 0, 0, 1, &renderBeginBarrier);
+
 		VkClearColorValue color = {{ 48.0f / 255.0f, 10.0f / 255.0f, 36.0f / 255.0f, 1.0f }};
 		VkClearValue clearColor = { color };
 
@@ -800,6 +810,10 @@ swapchainFormatPicked:
 
 
 		vkCmdEndRenderPass(commandBuffer); // NOTE: Can't have more than one renderpass in flight
+
+		VkImageMemoryBarrier renderEndBarrier = imageBarrier(swapchainImages[imageIndex], VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+		vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 
+							 VK_DEPENDENCY_BY_REGION_BIT, 0, 0, 0, 0, 1, &renderEndBarrier);
 
 		VK_CHECK(vkEndCommandBuffer(commandBuffer));
 
