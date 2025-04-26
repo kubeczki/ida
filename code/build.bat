@@ -3,6 +3,7 @@
 set VULKAN_SDK=C:\VulkanSDK\1.4.309.0
 set INCLUDE=%VULKAN_SDK%\Include;%INCLUDE%
 set LIB=%VULKAN_SDK%\Lib;%LIB%
+set GLSL_COMPILER=%VULKAN_SDK%\Bin\glslangValidator
 set PATH=%VULKAN_SDK%\Bin;%PATH%
 
 echo VULKAN_SDK=%VULKAN_SDK%
@@ -24,3 +25,8 @@ set LINKERFLAGS=-luser32 -lgdi32 -lvulkan-1 -fuse-ld=lld
 
 REM -Wl,/SUBSYSTEM:CONSOLE
 clang++ %CXXFLAGS% %IGNOREDWARNINGS% -o ../build/ida.exe ida.cpp %LINKERFLAGS% -Wl,/SUBSYSTEM:CONSOLE
+
+
+:: COMPILING SHADERS
+%GLSL_COMPILER% -V -o ../build/triangle.frag.spv triangle.frag.glsl
+%GLSL_COMPILER% -V -o ../build/triangle.vert.spv triangle.vert.glsl

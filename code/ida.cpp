@@ -99,10 +99,14 @@ extern "C" {
 	#define COLOR_WINDOW    5
 	#define WS_OVERLAPPEDWINDOW 0x00CF0000L
 	#define SW_SHOW			5
+	#define WM_SIZE			0x0005
 	#define WM_QUIT         0x0012
 	#define PM_REMOVE		0x0001
 	#define WM_KEYDOWN      0x0100
 	#define VK_ESCAPE		0x1B
+
+	#define LOWORD(l) ((unsigned short)((l) & 0xFFFF))
+	#define HIWORD(l) ((unsigned short)(((l) >> 16) & 0xFFFF))
 
 	// Function prototypes
 	LRESULT DefWindowProcA(HWND hWnd, UINT Msg, WPARAM wParam, LPARAM lParam);
@@ -177,10 +181,15 @@ typedef char byte;
 
 static b32 running = 1;
 
+static u32 windowWidth;
+static u32 windowHeight;
+static b32 windowResized;
+
 static VkInstance instance;
 static VkPhysicalDevice physicalDevice;
 static VkDevice device;
 static u32 queueFamilyIndex = 0; // SHORTCUT: this needs to be computed from queue properties
+static VkFormat swapchainFormat;
 
 
 /**
@@ -190,7 +199,7 @@ static u32 queueFamilyIndex = 0; // SHORTCUT: this needs to be computed from que
 asm(".align 64;"
     ".global vkSpvVert;"
     "vkSpvVert:;"
-    ".incbin \"triangle.vert.spv\";"
+    ".incbin \"../build/triangle.vert.spv\";"
     ".global vkSpvVertEnd;"
     "vkSpvVertEnd:;"
 );
@@ -198,7 +207,7 @@ asm(".align 64;"
 asm(".align 64;"
     ".global vkSpvFrag;"
     "vkSpvFrag:;"
-    ".incbin \"triangle.frag.spv\";"
+    ".incbin \"../build/triangle.frag.spv\";"
     ".global vkSpvFragEnd;"
     "vkSpvFragEnd:;"
 );
@@ -222,17 +231,26 @@ VkSemaphore createSemaphore(VkDevice device)
 // Window procedure
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 	switch (msg) {
-		case WM_KEYDOWN:
+		case WM_SIZE: {
+			UINT width = LOWORD(lParam);
+			UINT height = HIWORD(lParam);
+
+			windowWidth = width;
+			windowHeight = height;
+			windowResized = 1;
+		} break;
+		case WM_KEYDOWN: {
 			if (wParam == VK_ESCAPE) {
 				PostQuitMessage(0);
 				running = 0;
 				return 0;
 			}
-			break;
-		case WM_DESTROY:
+		} break;
+		case WM_DESTROY: {
 			PostQuitMessage(0);
 			running = 0;
 			return 0;
+		} break;
 	}
 	return DefWindowProcA(hwnd, msg, wParam, lParam);
 }
@@ -297,6 +315,165 @@ VkImageMemoryBarrier imageBarrier(
 	return result;
 }
 
+b32 supportsPresentation(VkPhysicalDevice physDevice, u32 familyIndex)
+{
+	b32 result = vkGetPhysicalDeviceWin32PresentationSupportKHR(physDevice, familyIndex);
+	printf("PRESENTATION SUPPORTED: %s\n", result ? "YES" : "NO");
+
+	return result;
+
+//#ifdef VK_USE_PLATFORM_WIN32_KHR
+//	return vkGetPhysicalDeviceWin32PresentationSupportKHR(physDevice, familyIndex);
+//#else
+//	return true;
+//#endif
+}
+
+u32 getGraphicsQueueFamily(VkPhysicalDevice physDevice)
+{
+	u32 queueCount = 0;
+	vkGetPhysicalDeviceQueueFamilyProperties(physDevice, &queueCount, 0);
+		
+	VkQueueFamilyProperties queues[64];
+	assert(queueCount < countof(queues));
+	vkGetPhysicalDeviceQueueFamilyProperties(physDevice, &queueCount, queues);
+
+	for (u32 i = 0; i < queueCount; i++)
+	{
+		if (queues[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)
+		{
+			return i;
+		}
+	}
+
+	return VK_QUEUE_FAMILY_IGNORED;
+}
+
+#define SWAPCHAIN_IMAGES 16
+typedef struct Swapchain
+{
+	VkSwapchainKHR swapchain;
+
+	VkImage images[SWAPCHAIN_IMAGES];
+	VkImageView imageViews[SWAPCHAIN_IMAGES];
+	VkFramebuffer framebuffers[SWAPCHAIN_IMAGES];
+	u8 imageCount;
+
+	u16 width;
+	u16 height;
+} Swapchain;
+
+void createSwapchain(
+	Swapchain *result,  
+	VkSurfaceKHR surface,
+	u32 width, 
+	u32 height,
+	VkRenderPass renderPass,
+	VkSwapchainKHR oldSwapchain)
+{
+	VkSurfaceCapabilitiesKHR surfaceCaps;
+	VK_CHECK(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physicalDevice, surface, &surfaceCaps));
+
+	VkCompositeAlphaFlagBitsKHR surfaceComposite = 
+		(surfaceCaps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR) ? VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR :
+		(surfaceCaps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR) ? VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR :
+		(surfaceCaps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR) ? VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR :
+		VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR;
+
+	VkSwapchainCreateInfoKHR swapchainInfo = { VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR };
+	{
+		swapchainInfo.surface = surface;
+		swapchainInfo.minImageCount = Max(2u, surfaceCaps.minImageCount);
+		swapchainInfo.imageFormat = swapchainFormat;
+		swapchainInfo.imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+		// TODO: This fixed the validation error, but do check the spec
+		swapchainInfo.imageExtent.width = width;
+		swapchainInfo.imageExtent.height = height;
+		swapchainInfo.imageArrayLayers = 1;
+		swapchainInfo.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+		swapchainInfo.queueFamilyIndexCount = 1;
+		swapchainInfo.pQueueFamilyIndices = &queueFamilyIndex;
+		swapchainInfo.preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+		swapchainInfo.compositeAlpha = surfaceComposite;
+		swapchainInfo.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+		swapchainInfo.oldSwapchain = oldSwapchain;
+	}
+	VkSwapchainKHR swapchain = 0;
+	VK_CHECK(vkCreateSwapchainKHR(device, &swapchainInfo, 0, &swapchain));
+	assert(swapchain);
+
+	u32 imageCount = 0;
+	VK_CHECK(vkGetSwapchainImagesKHR(device, swapchain, &imageCount, 0));
+
+	VkImage images[16]; // SHORTCUT: !!!
+	assert(imageCount < countof(images));
+	VK_CHECK(vkGetSwapchainImagesKHR(device, swapchain, &imageCount, images));
+
+	VkImageView imageViews[16] = {};
+	{
+		for (u32 i = 0; i < imageCount; ++i)
+		{
+			/**
+			* IMAGE VIEW
+			*/
+			VkImageViewCreateInfo imageViewInfo = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+			imageViewInfo.image = images[i];
+			imageViewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+			imageViewInfo.format = swapchainFormat;
+			imageViewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+			imageViewInfo.subresourceRange.levelCount = 1;
+			imageViewInfo.subresourceRange.layerCount = 1;
+
+			VK_CHECK(vkCreateImageView(device, &imageViewInfo, 0, &imageViews[i]));
+			assert(imageViews[i]);
+		}
+	}
+
+	VkFramebuffer framebuffers[16] = {};
+	{
+		for (u32 i = 0; i < imageCount; ++i)
+		{
+			/**
+			* FRAMEBUFFER
+			*/
+			VkFramebufferCreateInfo framebufferInfo = { VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO };
+			framebufferInfo.renderPass = renderPass;
+			framebufferInfo.attachmentCount = 1;
+			framebufferInfo.pAttachments = &imageViews[i];
+			framebufferInfo.width = width; // windowWidth
+			framebufferInfo.height = height; // windowHeight
+			framebufferInfo.layers = 1;
+
+			VK_CHECK(vkCreateFramebuffer(device, &framebufferInfo, 0, &framebuffers[i]));
+			assert(framebuffers[i]);
+		}
+	}
+
+	result->swapchain = swapchain;
+
+	result->imageCount = imageCount;
+	for (u32 i = 0; i < imageCount; i++)
+	{
+		result->images[i] = images[i];
+		result->imageViews[i] = imageViews[i];
+		result->framebuffers[i] = framebuffers[i];
+	}
+}
+
+void destroySwapchain(Swapchain *swapchain)
+{
+	for (u32 i = 0; i < swapchain->imageCount; i++)
+	{
+		vkDestroyFramebuffer(device, swapchain->framebuffers[i], 0);
+	}
+	for (u32 i = 0; i < swapchain->imageCount; i++)
+	{
+		vkDestroyImageView(device, swapchain->imageViews[i], 0);
+	}
+
+	vkDestroySwapchainKHR(device, swapchain->swapchain, 0);
+}
+
 // Entry point
 // Window application
 // int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
@@ -345,6 +522,15 @@ int main() {
 
 		instanceInfo.ppEnabledExtensionNames = instanceExtensions;
 		instanceInfo.enabledExtensionCount = countof(instanceExtensions);
+
+		// Thingy-majig to get sync validation
+		VkValidationFeaturesEXT validationFeatures = {};
+		validationFeatures.sType = VK_STRUCTURE_TYPE_VALIDATION_FEATURES_EXT;
+		VkValidationFeatureEnableEXT enabledFeatures[] = { VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT };
+		validationFeatures.enabledValidationFeatureCount = 1;
+		validationFeatures.pEnabledValidationFeatures = enabledFeatures;
+
+		instanceInfo.pNext = &validationFeatures;
 	}
 	VK_CHECK(vkCreateInstance(&instanceInfo, 0, &instance));
 
@@ -361,13 +547,16 @@ int main() {
 	PFN_vkCreateDebugReportCallbackEXT vkCreateDebugReportCallbackEXT = 
 		(PFN_vkCreateDebugReportCallbackEXT)vkGetInstanceProcAddr(instance, "vkCreateDebugReportCallbackEXT");
 
-	VkDebugReportCallbackEXT callback = 0;
-	VK_CHECK(vkCreateDebugReportCallbackEXT(instance, &callbackInfo, 0, &callback));
+	VkDebugReportCallbackEXT debugCallback = 0;
+	VK_CHECK(vkCreateDebugReportCallbackEXT(instance, &callbackInfo, 0, &debugCallback));
 
 	/**
 	* PICKING PHYSICAL DEVICE
 	*/
 	{
+		VkPhysicalDevice discrete = 0;
+		VkPhysicalDevice fallback = 0;
+
 		VkPhysicalDevice physicalDevices[16];
 		u32 physicalDeviceCount = countof(physicalDevices);
 		VK_CHECK(vkEnumeratePhysicalDevices(instance, &physicalDeviceCount, physicalDevices));
@@ -377,33 +566,44 @@ int main() {
 			VkPhysicalDeviceProperties props;
 			vkGetPhysicalDeviceProperties(physicalDevices[i], &props);
 
-			if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU)
+			printf("GPU %s\n", props.deviceName);
+
+			u32 familyIndex = getGraphicsQueueFamily(physicalDevices[i]);
+			if (familyIndex == VK_QUEUE_FAMILY_IGNORED) continue;
+			if (!supportsPresentation(physicalDevices[i], familyIndex)) continue;
+			if (!discrete && props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU)
 			{
-				printf("Picking discrete GPU %s\n", props.deviceName);
-				physicalDevice = physicalDevices[i];
-				goto physicalDeviceChosen;
+				discrete = physicalDevices[i];
+			}
+
+			if (!fallback)
+			{
+				fallback = physicalDevices[i];
 			}
 		}
 
-		if (physicalDeviceCount > 0)
+		if (!fallback)
 		{
-			VkPhysicalDeviceProperties props;
-			vkGetPhysicalDeviceProperties(physicalDevices[0], &props);
-
-			printf("Picking fallback GPU %s\n", props.deviceName);
-			physicalDevice = physicalDevices[0];
-			goto physicalDeviceChosen;
+			printf("ERROR: No GPUs found!\n");
 		}
 
-		printf("No physical devices available!\n");
-		return 0;
+		VkPhysicalDeviceProperties pickedProps;
 
-physicalDeviceChosen:
-		assert(physicalDevice);
+		if (discrete)
+		{
+			vkGetPhysicalDeviceProperties(discrete, &pickedProps);
+			printf("Picking discrete GPU %s\n", pickedProps.deviceName);
+			physicalDevice = discrete;
+		} else {
+			vkGetPhysicalDeviceProperties(fallback, &pickedProps);
+			printf("Picking fallback GPU %s\n", pickedProps.deviceName);
+			physicalDevice = fallback;
+		}
 	}
+	assert(physicalDevice);
 
 	/**
-	 * PICK QUEUE FAMILY (INDEX)
+	 * PICK GRAPHICS QUEUE FAMILY (INDEX)
 	 */
 	{
 		// NOTE: Typical thing in Vulkan where you call a function first without saving the result to just get the count
@@ -453,8 +653,8 @@ physicalDeviceChosen:
 	/**
 	* WIN32 WINDOW CREATION
 	*/
-	u32 windowWidth = 800; // TODO: Hardcoded for now, any win32 way of just getting?
-	u32 windowHeight = 600;
+	windowWidth = 800; // TODO: Hardcoded for now, any win32 way of just getting?
+	windowHeight = 600;
 
     HWND hwnd = CreateWindowExA(
         0, "MyClass", "Ida",
@@ -477,8 +677,8 @@ physicalDeviceChosen:
 	assert(surface);
 
 	/**
-	 * GETTING THE FORMAT
-	 */
+	* GETTING THE FORMAT
+	*/
 	u32 formatCount = 0;
 	VK_CHECK(vkGetPhysicalDeviceSurfaceFormatsKHR(physicalDevice, surface, &formatCount, 0));
 
@@ -488,7 +688,7 @@ physicalDeviceChosen:
 
 	assert(formatCount > 0); // TODO: This might need to handle either formatCount being 0 or first element reporting VK_FORMAT_UNDEFINED
 
-	VkFormat swapchainFormat = (VkFormat)0;
+	swapchainFormat = (VkFormat)0;
 
 	if (formatCount == 1 && formats[0].format == VK_FORMAT_UNDEFINED)
 	{
@@ -508,38 +708,44 @@ physicalDeviceChosen:
 	swapchainFormat = formats[0].format;
 swapchainFormatPicked:
 
+	/**
+	* RENDER PASS
+	*/
+	VkRenderPass renderPass = 0;
+	VkRenderPassCreateInfo renderPassInfo = { VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO };
+	{
+		VkAttachmentReference colorAttachments = { 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
+
+		VkSubpassDescription subpass = {};
+		subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+		subpass.colorAttachmentCount = 1;
+		subpass.pColorAttachments = &colorAttachments;
+
+		VkAttachmentDescription attachments[1] = {};
+		attachments[0].format = swapchainFormat;
+		attachments[0].samples = VK_SAMPLE_COUNT_1_BIT;
+		attachments[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+		attachments[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+		attachments[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+		attachments[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+		attachments[0].initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+		attachments[0].finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+		renderPassInfo.attachmentCount = countof(attachments);
+		renderPassInfo.pAttachments = attachments;
+		renderPassInfo.subpassCount = 1;
+		renderPassInfo.pSubpasses = &subpass;
+	}
+	VK_CHECK(vkCreateRenderPass(device, &renderPassInfo, 0, &renderPass));
+
 	VkSurfaceCapabilitiesKHR surfaceCaps;
 	VK_CHECK(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physicalDevice, surface, &surfaceCaps));
 
-	VkCompositeAlphaFlagBitsKHR surfaceComposite = 
-		(surfaceCaps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR) ? VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR :
-		(surfaceCaps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR) ? VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR :
-		(surfaceCaps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR) ? VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR :
-		VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR;
-
 	/**
-	* SWAPCHAIN CREATION
-	*/
-	VkSwapchainCreateInfoKHR swapchainInfo = { VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR };
-	{
-		swapchainInfo.surface = surface;
-		swapchainInfo.minImageCount = Max(2u, surfaceCaps.minImageCount);
-		swapchainInfo.imageFormat = swapchainFormat;
-		swapchainInfo.imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
-		// TODO: This fixed the validation error, but do check the spec
-		swapchainInfo.imageExtent.width = surfaceCaps.currentExtent.width; // windowWidth;
-		swapchainInfo.imageExtent.height = surfaceCaps.currentExtent.height; //windowHeight;
-		swapchainInfo.imageArrayLayers = 1;
-		swapchainInfo.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-		swapchainInfo.queueFamilyIndexCount = 1;
-		swapchainInfo.pQueueFamilyIndices = &queueFamilyIndex;
-		swapchainInfo.preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
-		swapchainInfo.compositeAlpha = surfaceComposite;
-		swapchainInfo.presentMode = VK_PRESENT_MODE_FIFO_KHR;
-	}
-	VkSwapchainKHR swapchain = 0;
-	VK_CHECK(vkCreateSwapchainKHR(device, &swapchainInfo, 0, &swapchain));
-
+	 * SWAPCHAIN CREATION
+	 */
+	Swapchain swapchain;
+	createSwapchain(&swapchain, surface, surfaceCaps.currentExtent.width, surfaceCaps.currentExtent.height, renderPass, 0);
 
 	/**
 	* ACQUIRE AND RELEASE SEMAPHORE CREATION
@@ -587,46 +793,17 @@ swapchainFormatPicked:
 	assert(triangleFS);
 
 	/**
-	* RENDER PASS
-	*/
-	VkRenderPass renderPass = 0;
-	VkRenderPassCreateInfo renderPassInfo = { VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO };
-	{
-		VkAttachmentReference colorAttachments = { 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
-
-		VkSubpassDescription subpass = {};
-		subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
-		subpass.colorAttachmentCount = 1;
-		subpass.pColorAttachments = &colorAttachments;
-
-		VkAttachmentDescription attachments[1] = {};
-		attachments[0].format = swapchainFormat;
-		attachments[0].samples = VK_SAMPLE_COUNT_1_BIT;
-		attachments[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-		attachments[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-		attachments[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-		attachments[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-		attachments[0].initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-		attachments[0].finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-
-		renderPassInfo.attachmentCount = countof(attachments);
-		renderPassInfo.pAttachments = attachments;
-		renderPassInfo.subpassCount = 1;
-		renderPassInfo.pSubpasses = &subpass;
-	}
-	VK_CHECK(vkCreateRenderPass(device, &renderPassInfo, 0, &renderPass));
-
-	/**
 	 * PIPELINE CREATION
 	 */
 	// NOTE: A pipeline HAS TO contain all the stuff that you might ever need/use
 	VkPipeline trianglePipeline = 0;
 
+	// TODO
 	VkPipelineCache pipelineCache = 0;
 
-	VkPipelineLayout layout = 0;
+	VkPipelineLayout pipelineLayout = 0;
 	VkPipelineLayoutCreateInfo layoutInfo = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-	VK_CHECK(vkCreatePipelineLayout(device, &layoutInfo, 0, &layout));
+	VK_CHECK(vkCreatePipelineLayout(device, &layoutInfo, 0, &pipelineLayout));
 
 	VkGraphicsPipelineCreateInfo pipelineInfo = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
 	{
@@ -682,61 +859,11 @@ swapchainFormatPicked:
 		dynamicState.pDynamicStates = dynamicStates;
 		pipelineInfo.pDynamicState = &dynamicState;
 
-		pipelineInfo.layout = layout;
+		pipelineInfo.layout = pipelineLayout;
 		pipelineInfo.renderPass = renderPass;
 	}
 	VK_CHECK(vkCreateGraphicsPipelines(device, pipelineCache, 1, &pipelineInfo, 0, &trianglePipeline));
 	assert(trianglePipeline);
-
-	/**
-	 * FRAMEBUFFERS AND IMAGE VIEWS CREATION
-	 */
-	u32 swapchainImageCount = 0;
-	VK_CHECK(vkGetSwapchainImagesKHR(device, swapchain, &swapchainImageCount, 0));
-
-	VkImage swapchainImages[16]; // SHORTCUT: !!!
-	assert(swapchainImageCount < countof(swapchainImages));
-	VK_CHECK(vkGetSwapchainImagesKHR(device, swapchain, &swapchainImageCount, swapchainImages));
-
-	VkImageView swapchainImageViews[16] = {};
-	{
-		for (u32 i = 0; i < swapchainImageCount; ++i)
-		{
-			/**
-		 * IMAGE VIEW
-		 */
-			VkImageViewCreateInfo imageViewInfo = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
-			imageViewInfo.image = swapchainImages[i];
-			imageViewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-			imageViewInfo.format = swapchainFormat;
-			imageViewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-			imageViewInfo.subresourceRange.levelCount = 1;
-			imageViewInfo.subresourceRange.layerCount = 1;
-
-			VK_CHECK(vkCreateImageView(device, &imageViewInfo, 0, &swapchainImageViews[i]));
-			assert(swapchainImageViews[i]);
-		}
-	}
-
-	VkFramebuffer swapchainImageFramebuffers[16] = {};
-	{
-		for (u32 i = 0; i < swapchainImageCount; ++i)
-		{
-		/**
-		* FRAMEBUFFER
-		*/
-			VkFramebufferCreateInfo framebufferInfo = { VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO };
-			framebufferInfo.renderPass = renderPass;
-			framebufferInfo.attachmentCount = 1;
-			framebufferInfo.pAttachments = &swapchainImageViews[i];
-			framebufferInfo.width = surfaceCaps.currentExtent.width; // windowWidth
-			framebufferInfo.height = surfaceCaps.currentExtent.height; // windowHeight
-			framebufferInfo.layers = 1;
-
-			VK_CHECK(vkCreateFramebuffer(device, &framebufferInfo, 0, &swapchainImageFramebuffers[i]));
-			assert(swapchainImageFramebuffers[i]);
-		}
-	}
 
 
 	VkCommandPool commandPool = 0;
@@ -764,10 +891,28 @@ swapchainFormatPicked:
 		if (PeekMessageA(&msg, 0, 0, 0, PM_REMOVE)) {
 			TranslateMessage(&msg);
 			DispatchMessageA(&msg);
+
+			if (!running) break;
+		}
+
+		if (windowWidth == 0 || windowHeight == 0) {
+			continue;
+		}
+
+		if (windowResized)
+		{
+			Swapchain old = swapchain;
+
+			createSwapchain(&swapchain, surface, windowWidth, windowHeight, renderPass, old.swapchain);
+
+			VK_CHECK(vkDeviceWaitIdle(device));
+			destroySwapchain(&old);
+
+			windowResized = 0;
 		}
 
 		u32 imageIndex = 0;
-		VK_CHECK(vkAcquireNextImageKHR(device, swapchain, UINT64_MAX, acquireSemaphore, VK_NULL_HANDLE, &imageIndex));
+		VK_CHECK(vkAcquireNextImageKHR(device, swapchain.swapchain, UINT64_MAX, acquireSemaphore, VK_NULL_HANDLE, &imageIndex));
 
 		VK_CHECK(vkResetCommandPool(device, commandPool, 0));
 
@@ -777,8 +922,8 @@ swapchainFormatPicked:
 		VK_CHECK(vkBeginCommandBuffer(commandBuffer, &beginInfo));
 
 		// NOTE: Before we start a pass we are rendering to an image and ???
-		VkImageMemoryBarrier renderBeginBarrier = imageBarrier(swapchainImages[imageIndex], 0, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-		vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 
+		VkImageMemoryBarrier renderBeginBarrier = imageBarrier(swapchain.images[imageIndex], 0, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+		vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 
 							 VK_DEPENDENCY_BY_REGION_BIT, 0, 0, 0, 0, 1, &renderBeginBarrier);
 
 		VkClearColorValue color = {{ 48.0f / 255.0f, 10.0f / 255.0f, 36.0f / 255.0f, 1.0f }};
@@ -786,9 +931,9 @@ swapchainFormatPicked:
 
 		VkRenderPassBeginInfo passBeginInfo = { VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO };
 		passBeginInfo.renderPass = renderPass; // abstract configuration thingy
-		passBeginInfo.framebuffer = swapchainImageFramebuffers[imageIndex]; // actual images
-		passBeginInfo.renderArea.extent.width = surfaceCaps.currentExtent.width; // windowWidth;
-		passBeginInfo.renderArea.extent.height = surfaceCaps.currentExtent.height; // windowHeight; // what are tilers?
+		passBeginInfo.framebuffer = swapchain.framebuffers[imageIndex]; // actual images
+		passBeginInfo.renderArea.extent.width = windowWidth;
+		passBeginInfo.renderArea.extent.height = windowHeight; // what are tilers?
 		passBeginInfo.clearValueCount = 1;
 		passBeginInfo.pClearValues = &clearColor;
 
@@ -811,7 +956,7 @@ swapchainFormatPicked:
 
 		vkCmdEndRenderPass(commandBuffer); // NOTE: Can't have more than one renderpass in flight
 
-		VkImageMemoryBarrier renderEndBarrier = imageBarrier(swapchainImages[imageIndex], VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+		VkImageMemoryBarrier renderEndBarrier = imageBarrier(swapchain.images[imageIndex], VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
 		vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 
 							 VK_DEPENDENCY_BY_REGION_BIT, 0, 0, 0, 0, 1, &renderEndBarrier);
 
@@ -834,7 +979,7 @@ swapchainFormatPicked:
 		presentInfo.waitSemaphoreCount = 1;
 		presentInfo.pWaitSemaphores = &releaseSemaphore;
 		presentInfo.swapchainCount = 1;
-		presentInfo.pSwapchains = &swapchain;
+		presentInfo.pSwapchains = &(swapchain.swapchain);
 		presentInfo.pImageIndices = &imageIndex;
 
 		VK_CHECK(vkQueuePresentKHR(queue, &presentInfo));
@@ -842,7 +987,30 @@ swapchainFormatPicked:
 		VK_CHECK(vkDeviceWaitIdle(device));
 	}
 
-	// TODO: destroy?
+	// NOTE: Wait for everything pending on device to complete
+	VK_CHECK(vkDeviceWaitIdle(device));
+
+	vkDestroyCommandPool(device, commandPool, 0);
+
+	destroySwapchain(&swapchain);
+
+	vkDestroyPipeline(device, trianglePipeline, 0);
+	vkDestroyPipelineLayout(device, pipelineLayout, 0);
+
+	vkDestroyShaderModule(device, triangleFS, 0);
+	vkDestroyShaderModule(device, triangleVS, 0);
+
+	vkDestroyRenderPass(device, renderPass, 0);
+
+	vkDestroySemaphore(device, releaseSemaphore, 0);
+	vkDestroySemaphore(device, acquireSemaphore, 0);
+
+	vkDestroySurfaceKHR(instance, surface, 0);
+
+	vkDestroyDevice(device, 0);
+
+	PFN_vkDestroyDebugReportCallbackEXT vkDestroyDebugReportCallbackEXT = (PFN_vkDestroyDebugReportCallbackEXT)vkGetInstanceProcAddr(instance, "vkDestroyDebugReportCallbackEXT");
+	vkDestroyDebugReportCallbackEXT(instance, debugCallback, 0);
 
 	vkDestroyInstance(instance, 0);
 
