@@ -15,7 +15,8 @@ REM echo PATH=%PATH%
 REM -Werror - treat all warnings as errors
 REM -fsanitize=address
 REM -D_DEBUG - is this Vulkan specific?
-set CXXFLAGS=-g -std=c++17 -Wall -Wextra -pedantic -fno-exceptions -fno-rtti -D_DEBUG
+:: -D_DEBUG
+set CXXFLAGS=-g -std=c++17 -Wall -Wextra -pedantic -fno-exceptions -fno-rtti
 REM -Wno-keyword-macro - keyword hidden by macro definition
 REM -Wno-language-extension-token - used __int64
 REM -Wmissing-field-initializers - struct intialization
@@ -28,5 +29,6 @@ clang++ %CXXFLAGS% %IGNOREDWARNINGS% -o ../build/ida.exe ida.cpp %LINKERFLAGS% -
 
 
 :: COMPILING SHADERS
-%GLSL_COMPILER% -V -o ../build/triangle.frag.spv triangle.frag.glsl
-%GLSL_COMPILER% -V -o ../build/triangle.vert.spv triangle.vert.glsl
+::%GLSL_COMPILER% -V -o ../build/triangle.frag.spv triangle.frag.glsl
+::%GLSL_COMPILER% -V -o ../build/triangle.vert.spv triangle.vert.glsl
+%GLSL_COMPILER% -V -o ../build/triangle.comp.spv triangle.comp.glsl
